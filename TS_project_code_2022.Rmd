@@ -1,0 +1,528 @@
+---
+title: "Forecasting of USD/CAD exchange rate using methods for time series analysis"
+author: "Arina Sitnikova"
+date: "July 2022"
+output:
+  pdf_document: default
+  html_document: default
+header-includes: \onehalfspacing
+geometry: margin = 1in
+fontsize: 11pt
+---
+<style>
+body {
+text-align: justify}
+</style>
+
+##### Summary
+
+The exchange rate is one of the key indicators of relative prices in open economies. That makes forecasting exchange rates extremely relevant. Hence, many researchers tried to determine the most suitable model – from the generalized financial models to the newest deep machine learning algorithms with the highest possible prediction ability. In the most recent studies, authors used such techniques as neural networks; however, the results often turned out contradictory from currency to currency.
+
+This project aims to predict the US dollar to the Canadian dollar exchange rate using the Bank of Canada data from January 1971 to June 2022. I built two types of forecast-specific models: ARIMA and VAR. ARIMA belongs to the class of models that explains a given series based on its past values (or lags). VAR is of great use for multiple time series (i.e. with more than one explanatory variable), and each variable is a function of not only its past lags but also past lags of all other variables. For the VAR model, I decided to include CPI (consumer price index), the interest and unemployment rates based on the previous research. 
+
+To compare the performance of each model against all other models, I used several accuracy metrics as the criterion yet considered MSE the most illustrative one due to the assumptions and data structure (e.g. absence of outliers). In addition, there were several specifications of the VAR model: I tried various combinations of the variables based on the correlation between the exchange rate and the other three variables. I also examined Granger causality, which helped determine whether one series was relevant in forecasting another. It turned out that the interest and unemployment rates could not offer as much explanatory power as CPI. 
+
+As a result, thanks to the complexity of the VAR model, it was efficient in forecasting. However, the ARIMA model also performed notably well since the exchange rate’s variance was mostly explained by its shocks instead of the other variables. It also should be noted that the parsimonious specification of ARIMA did not capture any trends and performed extremely poorly; for this reason, it was reasonable to estimate a model with a more substantial number of lags.  
+
+##### Univariate analysis
+
+The original monthly data of the USD/CAD exchange rate was converted to the time series format. The series is from January 1971 to June 2022. In total, there are 618 observations.
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(readxl)
+library(lmtest)
+library(tidyverse)
+library(forecast)
+library(gridExtra)
+library(psych)
+library(knitr)
+library(kableExtra)
+```
+
+```{r}
+ex_rate <- read_excel("~/Desktop/exch_data_cad2.xlsx")
+rate_ts <- ts(ex_rate, start = c(1971, 1), frequency = 12)
+```
+
+
+Confirming the size of the dataset:
+
+```{r}
+length(rate_ts)
+```
+
+Taking a look at the first 24 months of the data...
+
+```{r}
+head(rate_ts,24)
+```
+
+And the last 24 months:
+
+```{r}
+tail(rate_ts,24)
+```
+
+For training purposes, creating a separate dataset containing all data up to T-1 period (June 2021):
+
+```{r}
+train = window(rate_ts, end = c(2021,06))
+```
+
+Plotting the series:
+
+```{r}
+autoplot(rate_ts) + ggtitle("Figure 1. Exchange Rate, USD to CAD") + ylab('Exchange Rate')
+```
+
+We can assume that there are several structural breaks. A structural break occurs when we see a sudden change in the time series, which might be the case here. Structural breaks can lead to immense forecasting errors and unreliability of the model in general. If structural breaks are present, we should take this into account to avoid errors and make our forecast more precise. The potential structural breaks occured as per below:
+
+```{r message=FALSE, warning=FALSE}
+library(strucchange)
+bp_ts <- breakpoints(rate_ts ~ 1)
+#summary(bp_ts) 
+break_point <- breakpoints(rate_ts ~ 1)
+break_date <- breakdates(break_point)
+f1 <- c(rep(0, 91), rep(1, 277 - 91), rep(0, length(train) - 277))
+f2 <- c(rep(0, 277), rep(1, 405 - 277), rep(0, length(train) - 405))
+f3 <- c(rep(0, 405), rep(1, 500 - 405), rep(0, length(train) - 500))
+f4 <- c(rep(0, 500), rep(1, length(train) - 500))
+matrr <- matrix(c(f1,f2,f3,f4), ncol = 4)
+cat("Years with possible structural breaks:", round(breakdates(break_point), 0))
+```
+
+We will keep in mind these years. Also, we create a matrix which reflects the four structural breaks to take them into account in the further analysis. 
+
+Furthermore, we should understand whether the series has a trend or a seasonal pattern. If it does, it is necessary to take it into account while running ARIMA model to avoid any inconsistency in the estimates.
+
+Thus, the series was decomposed:
+
+```{r}
+plot(decompose(rate_ts))
+```
+
+As seen, the series does not have a determined upward nor downward trend; the only thing we can see there is an uneven pattern and fluctuations. Apart from this, we can conclude that even if there is a seasonal component, it is totally negligible: the scale of the seasonality graph is too small (from -.004 to .002). To sum up, it is highly likely that we've got neither trend nor seasonal pattern.
+
+After this, we check whether the original series is stationary or non-stationary. There are two plots, ACF and PACF, presented below:
+
+```{r}
+grid.arrange(ggAcf(rate_ts), ggPacf(rate_ts), nrow = 2)
+```
+
+For stationary series, it is expected to see autocorrelations that would decay to zero at higher lags. Clearly, it is not the case here: autocorrelations only slightly decrease over lags. Therefore, we can assume nonstationarity. To make sure, we will perform two tests on stationarity: ADF test (which takes H0 as nonstationarity) and KPSS test (in which H0 stands for stationarity).
+
+The result of the ADF test:
+```{r message=FALSE, warning=FALSE}
+library(tseries)
+adf.test(rate_ts, k = 10)
+```
+
+P-value is even greater than 0.1, then we can conclude that the null hypothesis of nonstationarity cannot be rejected at any appropriate level of confidence.
+
+The result of the KPSS test:
+```{r warning=FALSE}
+kpss.test(rate_ts, null = "Level")
+```
+
+P-value is 0.01; therefore we can reject the null hypothesis of stationarity at the 95% level of confidence, which confirms the results of the ADF test. Thus, the original series is not stationary. To get rid of non-stationarity, the first difference was taken. The plot and the ACF/PACF graphs are below: 
+
+```{r}
+diff_rate <- diff(rate_ts)
+autoplot(diff_rate) + ggtitle("Figure 4. Change in Exchange Rate, USD to CAD") + ylab("Exchange rate difference")
+```
+
+```{r}
+grid.arrange(ggAcf(diff_rate), ggPacf(diff_rate), nrow = 2)
+```
+
+Now the data looks stationary. Getting back to seasonality, the absence of regular spikes at specific lags (for example, spikes at the 4th, 8th, 12th lag and so on means quarterly seasonality) supports the assumption that there is no significant seasonal components. 
+
+Again, we take a look at the following tests to confirm that the differenced series is stationary:
+
+```{r warning=FALSE}
+adf.test(diff_rate, k = 10)
+kpss.test(diff_rate, null = "Level", lshort = TRUE) 
+```
+
+So, the ADF test shows that H0 is rejected at 95% (p-value = 0.01), and the KPSS test states that H0 is not rejected at 95% level of confidence, which means that now the series is stationary.
+
+To find out how accurate our forecast will be, we'll forecast the last available year at first. In case of time series, there is no point in predicting more than 12-24 months as the forecast will be highly inaccurate. 
+
+First of all, it is necessary to estimate ARIMA model. One of the possible ways to choose the best value for p and q lags it to take a look at ACF and PACF graphs of the train data:
+
+```{r}
+grid.arrange(ggAcf(diff(train)), ggPacf(diff(train)), nrow = 2)
+```
+
+So, it can be assumed that the original data (not differenced) may be analyzed as in ARIMA(4,1,1). The number of p is determined by the PACF graph; the ACF plot determines the number of q. The d was already proven to be equal to 1 as the first difference appeared to be stationary. However, the best way is to iterate through all the possible models and choose the best one according to the AIC criteria. As the Box-Jenkins approach recommends that the model be parsimonious, we set the maximum number of lags at five. Apart from this, we include the matrix consisting of four vectors which represent four structural breaks that we discussed above. The results of the Arima estimation are presented below:
+
+```{r}
+matr = matrix(0, nrow = 6, ncol = 6)
+for (i in 0:5){
+  for (j in 0:5) {
+    model = Arima(train, order=c(i,1,j), include.constant = TRUE, xreg = matrr)
+    matr[i+1,j+1] = model$aic
+  }
+}
+
+matr <- data.frame(matr)
+colnames(matr) <- c('q=0', 'q=1', 'q=2', 'q=3', 'q=4', 'q=5')
+rownames(matr) <- c('p=0', 'p=1', 'p=2', 'p=3', 'p=4', 'p=5')
+matr %>% kable() %>% kable_styling()
+```
+
+```{r}
+sprintf("The minimum AIC is: %f", min(matr))
+```
+
+The minimum AIC is found at p = 2, q = 4. After the estimation, we can verify that all lags are significant at least at 95% level. However, neither the drift nor the structural breaks vectors are significant, which means we can exclude them:
+
+```{r}
+coeftest(Arima(train, order = c(2,1,4), include.constant = TRUE, xreg = matrr))
+```
+
+```{r}
+fit2 <- Arima(train, order = c(2,1,4))
+```
+
+Thus, we estimate the ARIMA(2,1,4) model. Before building a forecast, it is important to examine the residuals:
+
+```{r}
+Box.test(residuals(fit2), lag = 20, type = 'Ljung')
+jarque.bera.test(residuals(fit2))
+```
+
+First, the Box-Ljung autocorrelation test was performed. The null hypothesis is that there is no autocorrelation, and since p-value is greater than 0.05, it cannot be rejected. However, having conducted the Jarque Bera Test for normality, it turned out that residuals are not normal (H0 was rejected). Nevertheless, forecasting can still be done in that case. 
+
+```{r}
+fore2 <- forecast(fit2, h = 12)
+```
+
+Finally, the forecast is illustrated below. For convenience, not the whole series is shown - only from the year of 2000.
+
+```{r message=FALSE, warning=FALSE}
+actual_data <- window(rate_ts, start = c(2021, 06), end = c(2022,06))
+autoplot(fore2, xlim = c(2000,2023)) + autolayer(actual_data, series = "Actual Exchange Rate") + autolayer(fore2$mean, series = "Forecast") + ylab('Exchange Rate')
+```
+
+From what we see, the forecast is not perfectly accurate, but the errors are not critical - the predicted values are relatively close to the real ones. Moreover, the actual values are within the 95% confidence interval.
+
+There is also automatic auto.arima function which is useful for us since it can either support or contradict our choice of lags. The results for auto.arima are presented below:
+
+```{r}
+fit0 <- auto.arima(train, d = 1, seasonal = TRUE)
+fit0
+```
+
+As seen, the model offered by computer differs from what we chose manually. It is more parsimonious though AIC is greater. However, the MA coefficient is still significant as we can say from the test of coefficients:
+
+```{r}
+coeftest(Arima(train, order = c(0,1,1)))
+```
+
+Then the autocorrelation and normality tests are performed: 
+
+```{r}
+Box.test(residuals(fit0), lag = 10, type = 'Ljung')
+jarque.bera.test(residuals(fit0))
+```
+
+Again, no autocorrelation is detected, but the residuals are not normal. Therefore, we can still make a forecast. It is presented graphically below:
+
+```{r}
+fore0 <- forecast(fit0, h = 12)
+```
+
+```{r message=FALSE, warning=FALSE}
+autoplot(fore0, xlim = c(2000,2023)) + autolayer(actual_data, series = "Actual Exchange Rate") + autolayer(fore0$mean, series = "Forecast") + ylab('Exchange Rate')
+```
+
+This forecast, although within the 95% confidence interval, looks less accurate (it does not reflect any trends and is constant during all 12 periods) than the previous one. To determine which forecast is better, it is worth taking a look at the accuracy metrics.
+
+Accuracy metrics for ARIMA(2,1,4):
+
+```{r}
+options(digits = 5)
+acc01 <- data.frame(accuracy(fore0, actual_data))
+acc01 %>% kable() %>% kable_styling()
+```
+
+Accuracy metrics for ARIMA(0,1,1):
+
+```{r}
+options(digits = 5)
+acc00 <- data.frame(accuracy(fore2, actual_data))
+acc00 %>% kable() %>% kable_styling()
+```
+
+On the test set, the errors are smaller in the first case. Therefore, it can be concluded that ARIMA(2,1,4) performs better in case of the 12-month univariate forecast of the USD/CAD exchange rate.
+
+Lastly, the table of forecast and actual values for this model (ARIMA(2, 1, 4):
+
+```{r}
+compare <- data.frame(cbind(fore2$mean, actual_data[-1]))
+colnames(compare) <- c('Forecast', 'Real Data')
+rownames(compare) <- c('Jul 2021', 'Aug 2021', 'Sep 2021', 'Oct 2021', 'Nov 2021', 'Dec 2021', 'Jan 2022', 'Feb 2022', 'Mar 2022', 'Apr 2022', 'May 2022', 'Jun 2022')
+compare$differ <- compare[,2] - compare[,1]
+colnames(compare) <- c('Forecast', 'Real Data', 'Difference')
+compare %>% kable() %>% kable_styling()
+```
+
+##### Multivariate analysis
+
+Now we use monthly data of the CAD/USD exchange rate, CPI (base year 2015), the interest rate and the unemployment rate, starting from January 1971 to April 2022 (most up-to-date data) with 616 observations in total.
+
+```{r include=FALSE}
+library(fpp)
+library(vars)
+library(readxl)
+```
+
+```{r}
+ts_data <- read_excel("~/Desktop/ts_data2.xlsx")
+series <- ts(ts_data, start = c(1971, 1), frequency = 12)
+actual_data2 <- window(series, start = c(2021, 04), end = c(2022,04))
+```
+
+
+The plot of the series:
+
+```{r}
+autoplot(series) + ggtitle("Figure 9. Series of Four Macroeconomic Indicators") + ylab('Value') 
+```
+
+No tests needed to say this multivariate time series is not stationary: for example, CPI variable has a determined trend upwards. So, we can choose whether we will proceed with this series or take the first difference to make the series stationary. Regardless of the choice, it is still possible to make a forecast and analyze the series properly. We decided to stay with nonstationary series. Therefore, we should keep in mind that we have to take a rather big number of lags - this is necessary for all further actions, such as building IRF, estimating FEDV and so on. We decided to limit the maximum number of lags to 20 before proceeding to the automatic lag selection procedure.
+
+The results of the lag selection:
+
+```{r}
+train2 = window(series, end = c(2021,04))
+VARselect(train2, lag.max = 20, type = "const")$selection
+```
+
+Two criteria stated that two lags are at best, and the other two selected thirteen lags. We will estimate the model with 13 lags as we have to stick to the huge number of lags.
+
+```{r}
+var1 <- VAR(train2, p = 13, type = "const")
+#summary(var1)
+```
+
+To check the presence of autocorrelation in the VAR(13) model, we perform an asymptotic Portmanteau (a significant number of observations allows it):
+
+```{r}
+serial.test(var1, lags.pt = 14, type = "PT.asymptotic") 
+```
+
+The test shows that the autocorrelation is present (the null hypothesis is rejected), which makes it impossible to make an adequate forecast. Moreover, the residuals are not normal:
+
+```{r}
+normality.test(var1, multivariate.only = TRUE)$jb.mul
+```
+
+Since it is impossible to proceed with the forecast, we should change the model. In practice, it is usual to keep N small and include only those variables that are correlated and, therefore, useful in forecasting each other. Thus, it can be helpful to get rid of one variable that does not have as much impact on the exchange rate. Let's take a look at the correlation matrix:
+
+```{r}
+correl <- data.frame(cor(series, y = NULL, use = "all.obs", method = c("pearson")))
+correl %>% kable() %>% kable_styling()
+```
+
+From this table, we can see a more or less significant correlation between the exchange rate and CPI, the exchange rate and unemployment, but no correlation between the exchange rate and the interest rate. If we drop it, the performance might be better (at least, we may be able to make predictions), so we will try this option. 
+
+With the new series consisted of the exchange rate, CPI and unemployment rate, it was suggested using VAR(13) or VAR(2) model based on the VAR selection:
+
+```{r}
+data3 <- data.frame(train2)
+data3 <- data3[-3]
+series_3 <- ts(data3, start = c(1971, 1), frequency = 12)
+VARselect(series_3, lag.max = 20, type = "const")$selection
+var3 <- VAR(series_3, p = 13, type = "const")
+```
+
+Again, since we have nonstationary series, we choose and estimate the model with a bigger number of lags. The asymptotic PT and normality tests were performed as well:
+
+```{r}
+serial.test(var3, lags.pt = 20, type = "PT.asymptotic") 
+normality.test(var3, multivariate.only = TRUE)
+```
+
+The Portmanteau test did not reject the null hypothesis of no autocorrelation this time. Although the residuals are not normal, now we can still make a forecast 
+
+Beforehand, it would be helpful to check Granger Causality. There is no point in keeping a variable if it does not help to improve a forecast of the initial variable (in our case, exchange rate). The results are presented below:
+
+```{r}
+causality(var3, "CPI")$Granger
+causality(var3, "exchange_rate")$Granger
+causality(var3, "unempl_rate")$Granger
+```
+
+It appears that at the 90% level, CPI measure Granger-causes both the the exchange and unemployment rate (null hypothesis can be rejected). Likewise, at the 95% level of confidence, the exchange rate Granger-causes CPI and unemployment rate. This means that at least CPI can improve the forecast of the exchange rate (and vice-versa). Lastly, the unemployment rate does not Granger-cause the exchange rate and CPI together, but it is impossible to detect individual impact here. 
+
+To check the relationship between the unemployment rate and the exchange rate, we decided to limit the series to these two variables only. Meanwhile, it is possible to estimate the VAR(3) model for unemployment and exchange rate since there is no autocorrelation (refer to VAR selection procedure and autocorrelation test below). What we want to know now is the relationship between exchange rate and unemployment rate:
+
+```{r}
+###VAR(6) w/ unemp and exch rate 
+data2 <- data.frame(train2)
+data2 <- data2[-c(2,3)]
+series_2 <- ts(data2, start = c(1971, 1), frequency = 12)
+VARselect(series_2, lag.max = 20, type = "const")$selection
+var2 <- VAR(series_2, p = 3, type = "const")
+serial.test(var2, lags.pt = 10, type = "PT.asymptotic") 
+```
+
+```{r}
+causality(var2, 'exchange_rate')$Granger
+causality(var2, 'unempl_rate')$Granger
+```
+
+So, it turned out that the unemployment rate does not Granger-cause the exchange rate (all the coefficients on lagged values of the unemployment rate are zero in the equation for the exchange rate), which means it does not help to improve the forecast, however the exchange rate does Granger-cause the unemployment rate.
+
+Since the unemployment rate variable does not seem to help improve the forecast of the exchange rate's future values, we also decided to build the third model which consisted of the vector of two variables: CPI and the exchange rate. In short, the model with 13 lags was estimated, no autocorrelation was found. What is surprising - the CPI indicator does not Granger-cause the exchange-rate, and the vice-versa is not true either:
+
+```{r}
+#VAR(13) for cpi and unemp
+data4 <- data.frame(train2)
+data4 <- data4[c('CPI', 'exchange_rate')]
+series_4 <- ts(data4, start = c(1971, 1), frequency = 12)
+VARselect(series_4, lag.max = 20, type = "const")$selection 
+var4 <- VAR(series_4, p = 13, type = "const")
+serial.test(var4, lags.pt = 20, type = "PT.asymptotic") #no autocor
+```
+
+```{r}
+causality(var4, 'exchange_rate')$Granger
+causality(var4, 'CPI')$Granger 
+```
+
+Anyway, we decided to make a forecast for all three models that we mentioned and compare their performance:
+
+1) VAR(13) with three variables: exchange rate, CPI, unemployment rate;
+
+2) VAR(3) with two variables: exchange rate, unemployment rate;
+
+3) VAR(13) with two variables: exchange rate, CPI.
+
+
+```{r message=FALSE, warning=FALSE}
+#FORECAST VAR(13) w/ three variables
+varfore3 <- forecast(var3, h = 12)
+plot3 <- autoplot(varfore3$forecast$exchange_rate, xlim = c(2000,2023),  main = "Exchange Rate Forecast from VAR(13)") + autolayer(actual_data2[,1], series = "Actual Value") + autolayer(varfore3$forecast$exchange_rate$mean, series = "Forecast") + ylab('Exchange Rate')
+#plot4 <- autoplot(varfore3$forecast$unempl_rate, xlim = c(2000,2023),  main = "Unemployment Rate Forecast") + autolayer(actual_data2[,'unempl_rate'], series = "Actual Value") + autolayer(varfore3$forecast$unempl_rate$mean, series = "Forecast") + ylab('Unemployment Rate')
+#plot44 <- autoplot(varfore3$forecast$CPI, xlim = c(2000,2023),  main = "CPI Forecast") + autolayer(actual_data2[,'CPI'], series = "Actual Value") + autolayer(varfore3$forecast$CPI$mean, series = "Forecast") + ylab('CPI')
+#grid.arrange(plot3, plot4, ncol = 1)
+```
+
+```{r message=FALSE, warning=FALSE}
+#Forecast VAR(3) w/ unemp and exchange
+varfore <- forecast(var2, h = 12)
+plot1 <- autoplot(varfore$forecast$exchange_rate, xlim = c(2000,2023),  main = "Exchange Rate Forecast from VAR(3)") + autolayer(actual_data2[,1], series = "Actual Value") + autolayer(varfore$forecast$exchange_rate$mean, series = "Forecast") + ylab('Exchange Rate')
+#plot2 <- autoplot(varfore$forecast$unemp, xlim = c(2000,2018),  main = "Unemployment Rate Forecast from VAR(3)") + autolayer(actual_data2[,4], series = "Actual Value") + autolayer(varfore$forecast$unemp$mean, series = "Forecast") + ylab('Unemployment Rate')
+#grid.arrange(plot1, plot2, ncol = 1)
+```
+
+```{r message=FALSE, warning=FALSE}
+#Forecast VAR(13) w/ cpi and exchange
+varfore4 <- forecast(var4, h = 12)
+plot7 <- autoplot(varfore4$forecast$exchange_rate, xlim = c(2000,2023),  main = "Exchange Rate Forecast from VAR(13)") + autolayer(actual_data2[,1], series = "Actual Value") + autolayer(varfore4$forecast$exchange_rate$mean, series = "Forecast") + ylab('Exchange Rate')
+#plot8 <- autoplot(varfore4$forecast$cpi, xlim = c(2000,2018),  main = "CPI Forecast from VAR(13)") + autolayer(actual_data2[,2], series = "Actual Value") + autolayer(varfore4$forecast$cpi$mean, series = "Forecast") + ylab(' CPI')
+#grid.arrange(plot7, plot8, ncol = 1)
+```
+
+Accuracy measures of the exchange rate forecast for three multivariate models are presented below. We also added the results from the univariate forecast:
+
+```{r}
+acc1 <- data.frame(accuracy(varfore$forecast$exchange_rate$mean, actual_data2[,1])[1,])  #unemp and exchange
+acc3 <- data.frame(accuracy(varfore3$forecast$exchange_rate$mean, actual_data2[,1])[1,]) #best three variables 
+acc4 <- data.frame(accuracy(varfore4$forecast$exchange_rate$mean, actual_data2[,1])[1,]) # cpi and exchange
+acc2 <- data.frame(accuracy(fore2, actual_data)[2,])
+acc2 <- acc2[-6,]
+dfcomp <- cbind(acc3, acc1, acc4, acc2)
+colnames(dfcomp) <- c("Multivariate1 (CPI+unemp+exchange)", "Multivariate2 (exchange+unemp)", "Multivariate3 (CPI+exchange)", "Univariate")
+dfcomp %>% kable() %>% kable_styling()
+```
+
+As seen from the table, the first multivariate model (that has three variables - the exchange rate, cpi and the unemployment rate) has the largest error measures. It can be explained by the fact that the unemployment rate does not Granger-cause the exchange rate (that's why the second model also performed relatively poorly. On the contrary, the third forecast performed much better and had the lowest error in each accuracy measure. The univariate model also showed good performance of the same level as the third multivariate model. 
+
+To sum up, below is the best exchange rate forecast (i.e. VAR(13) with CPI and exchange rate) plotted along with the table of actual and forecast values:
+
+```{r message=FALSE, warning=FALSE}
+plot7
+```
+
+```{r}
+comparew <- data.frame(cbind(varfore4$forecast$exchange$mean, actual_data2[-1,1]))
+colnames(comparew) <- c('Forecast', 'Real Data')
+rownames(comparew) <- c('May 2021', 'Jun 2021', 'Jul 2021', 'Aug 2021', 'Sep 2021', 'Oct 2021', 'Nov 2021', 'Dec 2021', 'Jan 2022', 'Feb 2022', 'Mar 2022', 'Apr 2022')
+comparew$differ2 <- comparew[,2] - comparew[,1]
+colnames(comparew) <- c('Forecast', 'Real Data', 'Difference')
+comparew %>% kable() %>% kable_styling()
+```
+
+What we can actually see is that VAR model managed to get more correct prediction in comparison to ARIMA. As VAR was trying to capture more complex dependencies, it was able to capture a sudden shock which made the real exchange rate go up sharply. ARIMA simply relied on the previous lags and therefore its predictions tended to the average of the previous values which was not enough in our case.
+
+Moving to the structural analysis, the order of variables is vital here - the result will differ depending on the ordering. Therefore, we decided to reorder data so that CPI be ahead of the exchange rate as it is more powerful based on the previous tests. The unemployment rate was set in the last column as it does not have a substantial effect on either the exchange rate or CPI.
+
+VAR is actually a reduced form model. Structural VAR reflects the implied structure among variables in the system. It is impossible to estimate SVAR directly, so we have to estimate a reduced-form VAR and then restore the parameters of the structural form. For example, we can compute $(B_0)^{-1}$ using Choleski decomposition:
+```{r, eval=FALSE, include=FALSE}
+#Omega_hat <- summary(var3)$covres
+#chol(Omega_hat) %>% t()
+#Psi(var4)[,,1]
+```
+
+```{r}
+#another order
+data_reorder <- series_3[, c('CPI', 'exchange_rate', 'unempl_rate')]
+var3a <- VAR(data_reorder, p = 13, type = "const")
+Omega_hat <- summary(var3a)$covres
+chol(Omega_hat) %>% t()
+```
+
+If we have a structural form, we can obtain impulse response functions and forward error variance decomposition.
+With the help of IRFs and FEVDs, we can examine the effect of other variables on the dependent variable (exchange rate), the sign of the impact and its length.
+
+First, we investigate the IRF which means the responsiveness of the exchange rate to shocks on itself, CPI and unemployment rate. Figures below show the IRFs of CPI, unemployment rate and exchange rate respectively:
+
+```{r, eval=FALSE, include=FALSE}
+#First try - poor results;
+#irf3 <- irf(var3, impulse = "cpi", response = c("exchange"), n.ahead = 20, cumulative = FALSE)
+#plot(irf3)
+#irf4 <- irf(var3, impulse = "unemp", response = c("exchange"), n.ahead = 20, cumulative = FALSE)
+#plot(irf4)
+```
+
+```{r}
+irf3a <- irf(var3a, impulse = c('CPI'), response = c("exchange_rate"), n.ahead = 20, cumulative = FALSE)
+plot(irf3a)
+```
+
+```{r}
+irf4a <- irf(var3a, impulse = "unempl_rate", response = c("exchange_rate"), n.ahead = 20, cumulative = FALSE)
+plot(irf4a)
+```
+
+```{r}
+irf3c <- irf(var3a, impulse = c('exchange_rate'), response = c("exchange_rate"), n.ahead = 20, cumulative = FALSE)
+plot(irf3c)
+```
+
+Starting with CPI, the price level increases are supposed to bring negative effect to the USD/CAD exchange rate in the short-run, having its peak in the 4th period. That was expected since the higher prices discourage agents from buying domestic goods, so the demand for the local (Canadian) currency is going down; therefore, the exchange rate USD/CAD decreases (the US dollar becomes more valuable). The impulse response is significant from appr. the second period to the sixth period after which the confidence interval started to have zero within its borders.
+
+The sign of the unemployment rate effect was fluctuating; however, we can notice that the confidence interval always includes zero, that's why the response is insignificant. 
+
+In case of a structural shock to the exchange rate itself, it gives a positive permanent response for growth of the exchange rate. In the short and medium period the response fluctuates; in long-run, it decreases steadily. 
+
+A shock to the variable will not only have an impact on this variable, but it will also influence other variables. We can see that if we perform forecast error variance decomposition as well. The FEVD allows to analyze the contribution of variable j to the h-step forecast error variance of variable k. We are interested in the exchange rate, so we will only leave the results of FEVD of this variable:
+
+```{r}
+fevd <- data.frame(fevd(var3a, n.ahead = 12)$exchange)
+fevd[, c('exchange_rate', 'CPI','unempl_rate')]
+```
+
+As seen, most of the error variance of the exchange rate can be explained by the shocks to their own series. Only up to 3% of the error variance is explained by CPI, while the unemployment rate does not explain anything at all. The same situation can be observed if we take a look at FEVD of CPI or unemployment rate - they can be mostly explained by their own shocks. 
+
+##### Conclusion
+
+To conclude, with the help of a more complex methods of econometric analysis, the mulitvariate VAR model turned out to perform better than any other suggested specification of the VAR model and was able to predict the upward trend of the currency in 2021-2022. However, despite being a "simple" model, the ARIMA(2, 1, 4) model showed great results as well. Overall, the exchange rate was mostly explained by its own shocks. 
+
+
+
+
